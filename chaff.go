@@ -3,7 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"fmt"
-	_ "io"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -36,7 +36,8 @@ func formatBytes(bytes uint64) string {
 }
 
 // generateChaffFile creates a file filled with random data
-func generateChaffFile(filename string, sizeMB int64, availableSpace uint64) (uint64, error) {
+// returns (remainingSpace, bytesWritten, error)
+func generateChaffFile(filename string, sizeMB int64, availableSpace uint64) (uint64, uint64, error) {
 	sizeBytes := uint64(sizeMB) * 1024 * 1024
 
 	// Don't exceed available space
@@ -45,12 +46,12 @@ func generateChaffFile(filename string, sizeMB int64, availableSpace uint64) (ui
 	}
 
 	if sizeBytes == 0 {
-		return availableSpace, nil
+		return availableSpace, 0, nil
 	}
 
 	file, err := os.Create(filename)
 	if err != nil {
-		return availableSpace, err
+		return availableSpace, 0, err
 	}
 	defer file.Close()
 
@@ -69,13 +70,13 @@ func generateChaffFile(filename string, sizeMB int64, availableSpace uint64) (ui
 		buffer := make([]byte, currentChunk)
 		_, err := rand.Read(buffer)
 		if err != nil {
-			return availableSpace - bytesWritten, err
+			return availableSpace - bytesWritten, bytesWritten, err
 		}
 
 		// Write to file
 		written, err := file.Write(buffer)
 		if err != nil {
-			return availableSpace - bytesWritten, err
+			return availableSpace - bytesWritten, bytesWritten, err
 		}
 
 		bytesWritten += uint64(written)
@@ -86,8 +87,110 @@ func generateChaffFile(filename string, sizeMB int64, availableSpace uint64) (ui
 		}
 	}
 
+	// Ensure data is flushed to disk
+	if err := file.Sync(); err != nil {
+		return availableSpace - bytesWritten, bytesWritten, err
+	}
+
 	fmt.Printf("Created: %s (%s)\n", filename, formatBytes(sizeBytes))
-	return availableSpace - sizeBytes, nil
+	return availableSpace - sizeBytes, bytesWritten, nil
+}
+
+// shredFile overwrites the file with DoD-like 3 passes and removes it:
+// pass 1: 0xFF, pass 2: 0x00, pass 3: random bytes.
+func shredFile(path string) error {
+	const chunkSize = 1024 * 1024 // 1MB
+
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		// If file can't be opened for writing, attempt to remove it
+		_ = os.Remove(path)
+		return err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	size := info.Size()
+	if size == 0 {
+		_ = f.Close()
+		return os.Remove(path)
+	}
+
+	passes := []int{0, 1, 2} // 0 -> 0xFF, 1 -> 0x00, 2 -> random
+
+	buf := make([]byte, chunkSize)
+
+	for _, pass := range passes {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+
+		remaining := size
+		for remaining > 0 {
+			toWrite := int64(chunkSize)
+			if remaining < toWrite {
+				toWrite = remaining
+			}
+
+			switch pass {
+			case 0:
+				// 0xFF
+				for i := int64(0); i < toWrite; i++ {
+					buf[i] = 0xFF
+				}
+			case 1:
+				// 0x00
+				for i := int64(0); i < toWrite; i++ {
+					buf[i] = 0x00
+				}
+			case 2:
+				// random
+				if _, err := rand.Read(buf[:toWrite]); err != nil {
+					return err
+				}
+			}
+
+			n, err := f.Write(buf[:toWrite])
+			if err != nil {
+				return err
+			}
+			if int64(n) != toWrite {
+				return fmt.Errorf("short write while shredding %s", path)
+			}
+			remaining -= toWrite
+		}
+
+		// Ensure pass is flushed
+		if err := f.Sync(); err != nil {
+			return err
+		}
+	}
+
+	// Close before removal
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	// Finally remove the file
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+
+	fmt.Printf("Shredded and removed: %s\n", path)
+	return nil
+}
+
+func shredFiles(files []string) {
+	for _, f := range files {
+		if err := shredFile(f); err != nil {
+			fmt.Printf("Error shredding %s: %v\n", f, err)
+		}
+	}
 }
 
 func main() {
@@ -112,6 +215,12 @@ func main() {
 		return
 	}
 
+	// Ensure output directory exists
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		fmt.Printf("Error creating directory %s: %v\n", outputDir, err)
+		return
+	}
+
 	fileCount := 0
 	availableSpace, err := getAvailableSpace(outputDir)
 	if err != nil {
@@ -119,8 +228,10 @@ func main() {
 		return
 	}
 
+	createdFiles := []string{}
+
 	fmt.Printf("\nStarting with %s available\n", formatBytes(availableSpace))
-	fmt.Println("Generating chaff files...\n")
+	fmt.Println("Generating chaff files...")
 
 	for availableSpace > 0 {
 		filename := filepath.Join(outputDir, fmt.Sprintf("%s%06d.dat", filePrefix, fileCount))
@@ -128,23 +239,30 @@ func main() {
 		// Check if we're about to run out of space for even a small file
 		if availableSpace < 10*1024*1024 { // Less than 10MB left
 			fmt.Println("Less than 10MB remaining, creating final small file...")
-			// Create one final small file with remaining space
+			// Create one final small file with remaining space (attempt 1MB but generator will cap)
 			finalFilename := filepath.Join(outputDir, fmt.Sprintf("%sFINAL.dat", filePrefix))
-			remainingSpace, err := generateChaffFile(finalFilename, 1, availableSpace)
+			remainingSpace, bytesCreated, err := generateChaffFile(finalFilename, 1, availableSpace)
 			if err != nil {
 				fmt.Printf("Error creating final file: %v\n", err)
+			} else if bytesCreated > 0 {
+				createdFiles = append(createdFiles, finalFilename)
 			}
 			availableSpace = remainingSpace
 			break
 		}
 
 		// Generate regular chaff file
-		remainingSpace, err := generateChaffFile(filename, fileSizeMB, availableSpace)
+		remainingSpace, bytesCreated, err := generateChaffFile(filename, fileSizeMB, availableSpace)
 		if err != nil {
 			fmt.Printf("Error creating file %s: %v\n", filename, err)
 			// Try to continue with next file
 			fileCount++
 			continue
+		}
+
+		// If generator wrote data, track the file for later shredding
+		if bytesCreated > 0 {
+			createdFiles = append(createdFiles, filename)
 		}
 
 		availableSpace = remainingSpace
@@ -157,12 +275,28 @@ func main() {
 		}
 	}
 
-	fmt.Printf("\n=== Operation Complete ===\n")
+	fmt.Printf("\n=== Generation Complete ===\n")
 	fmt.Printf("Total files created: %d\n", fileCount)
 
 	// Final space check
 	finalSpace, err := getAvailableSpace(outputDir)
 	if err == nil {
-		fmt.Printf("Final available space: %s\n", formatBytes(finalSpace))
+		fmt.Printf("Space remaining before shredding: %s\n", formatBytes(finalSpace))
 	}
+
+	// Shred created files using DoD-like passes
+	if len(createdFiles) > 0 {
+		fmt.Println("\nShredding created chaff files...")
+		shredFiles(createdFiles)
+	} else {
+		fmt.Println("No chaff files to shred.")
+	}
+
+	// Final space check after shredding
+	finalSpaceAfter, err := getAvailableSpace(outputDir)
+	if err == nil {
+		fmt.Printf("Final available space: %s\n", formatBytes(finalSpaceAfter))
+	}
+
+	fmt.Printf("\n=== Operation Complete ===\n")
 }
