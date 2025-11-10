@@ -1,16 +1,20 @@
+//go:build linux || darwin
+// +build linux darwin
+
 package main
 
 import (
-	"crypto/rand"
 	"fmt"
-	"io"
-	"os"
+	_ "os"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
-// ANSI color codes
+// ANSI colors
 const (
 	ColorReset  = "\033[0m"
 	ColorRed    = "\033[31m"
@@ -20,8 +24,11 @@ const (
 	barWidth    = 40
 )
 
-// Helpers
 func colorize(s, color string) string { return color + s + ColorReset }
+
+// ================================================================
+// Progress and Formatting
+// ================================================================
 
 func renderBar(written, total uint64) string {
 	if total == 0 {
@@ -41,201 +48,175 @@ func printProgress(prefix string, written, total uint64) {
 	if total > 0 {
 		percent = (float64(written) / float64(total)) * 100.0
 	}
-	fmt.Printf("\r%s %s %6.2f%%", prefix, bar, percent)
+	msg := fmt.Sprintf("\r%s %s %6.2f%%", prefix, bar, percent)
+	unix.Write(unix.Stdout, []byte(msg))
 	if written >= total {
-		fmt.Print("\n")
+		unix.Write(unix.Stdout, []byte("\n"))
 	}
 }
 
-// getAvailableSpace returns available disk space in bytes
-func getAvailableSpace(path string) (uint64, error) {
-	var stat syscall.Statfs_t
-	err := syscall.Statfs(path, &stat)
-	if err != nil {
-		return 0, err
-	}
-	// Available blocks * block size
-	return stat.Bavail * uint64(stat.Bsize), nil
-}
-
-// formatBytes converts bytes to human readable string
-func formatBytes(bytes uint64) string {
+func formatBytes(b uint64) string {
 	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
 	}
 	div, exp := uint64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
+	for n := b / unit; n >= unit; n /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-// generateChaffFile creates a file filled with random data
-// returns (remainingSpace, bytesWritten, error)
-func generateChaffFile(filename string, sizeMB int64, availableSpace uint64) (uint64, uint64, error) {
-	sizeBytes := uint64(sizeMB) * 1024 * 1024
+// ================================================================
+// System Utilities
+// ================================================================
 
-	// Don't exceed available space
-	if sizeBytes > availableSpace {
-		sizeBytes = availableSpace
+func getAvailableSpace(path string) (uint64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return 0, err
 	}
+	return stat.Bavail * uint64(stat.Bsize), nil
+}
 
-	if sizeBytes == 0 {
-		return availableSpace, 0, nil
-	}
-
-	file, err := os.Create(filename)
+func readUrandom(buf []byte) error {
+	fd, err := unix.Open("/dev/urandom", unix.O_RDONLY, 0)
 	if err != nil {
-		return availableSpace, 0, err
+		return err
 	}
-	defer file.Close()
+	defer unix.Close(fd)
 
-	// Write in chunks to manage memory usage
-	const chunkSize = 1024 * 1024 // 1MB chunks
-	var bytesWritten uint64
+	total := 0
+	for total < len(buf) {
+		n, err := unix.Read(fd, buf[total:])
+		if err != nil {
+			return err
+		}
+		total += n
+	}
+	return nil
+}
 
+// ================================================================
+// File Generation (Direct Syscalls)
+// ================================================================
+
+func generateChaffFile(filename string, sizeMB int64, available uint64) (uint64, uint64, error) {
+	sizeBytes := uint64(sizeMB) * 1024 * 1024
+	if sizeBytes > available {
+		sizeBytes = available
+	}
+	if sizeBytes == 0 {
+		return available, 0, nil
+	}
+
+	fd, err := unix.Open(filename, unix.O_CREAT|unix.O_WRONLY|unix.O_TRUNC, 0644)
+	if err != nil {
+		return available, 0, err
+	}
+	defer unix.Close(fd)
+
+	const chunkSize = 1024 * 1024
+	buf := make([]byte, chunkSize)
+	var written uint64
 	base := filepath.Base(filename)
 	prefix := colorize(fmt.Sprintf("Writing %s", base), ColorCyan)
 
-	for bytesWritten < sizeBytes {
-		remaining := sizeBytes - bytesWritten
-		currentChunk := chunkSize
-		if remaining < chunkSize {
-			currentChunk = int(remaining)
+	for written < sizeBytes {
+		remain := sizeBytes - written
+		n := chunkSize
+		if remain < uint64(n) {
+			n = int(remain)
 		}
-
-		// Generate random data
-		buffer := make([]byte, currentChunk)
-		_, err := rand.Read(buffer)
+		if err := readUrandom(buf[:n]); err != nil {
+			return available - written, written, err
+		}
+		w, err := unix.Write(fd, buf[:n])
 		if err != nil {
-			return availableSpace - bytesWritten, bytesWritten, err
+			return available - written, written, err
 		}
-
-		// Write to file
-		written, err := file.Write(buffer)
-		if err != nil {
-			return availableSpace - bytesWritten, bytesWritten, err
-		}
-
-		bytesWritten += uint64(written)
-
-		// Update inline progress
-		printProgress(prefix, bytesWritten, sizeBytes)
+		written += uint64(w)
+		printProgress(prefix, written, sizeBytes)
 	}
 
-	// Ensure data is flushed to disk
-	if err := file.Sync(); err != nil {
-		return availableSpace - bytesWritten, bytesWritten, err
-	}
-
+	unix.Fsync(fd)
 	fmt.Printf("%s %s\n", colorize("Created:", ColorGreen), filename)
-	return availableSpace - sizeBytes, bytesWritten, nil
+	return available - sizeBytes, written, nil
 }
 
-// shredFile overwrites the file with DoD-like 3 passes and removes it:
-// pass 1: 0xFF, pass 2: 0x00, pass 3: random bytes.
+// ================================================================
+// Shredding Logic (Low-Level)
+// ================================================================
+
 func shredFile(path string) error {
-	const chunkSize = 1024 * 1024 // 1MB
-
-	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	fd, err := unix.Open(path, unix.O_RDWR, 0)
 	if err != nil {
-		_ = os.Remove(path)
+		unix.Unlink(path)
 		return err
 	}
-	defer f.Close()
+	defer unix.Close(fd)
 
-	info, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Unlink(path)
 		return err
 	}
-	size := info.Size()
-	if size == 0 {
-		_ = f.Close()
-		return os.Remove(path)
+
+	if st.Size == 0 {
+		unix.Unlink(path)
+		return nil
 	}
 
-	passes := []int{0, 1, 2} // 0 -> 0xFF, 1 -> 0x00, 2 -> random
+	size := int(st.Size)
+	const chunkSize = 1024 * 1024
 	buf := make([]byte, chunkSize)
 	base := filepath.Base(path)
+	passes := []string{"0xFF", "0x00", "random"}
 
-	for _, pass := range passes {
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-
-		remaining := size
-		var writtenThisPass int64 = 0
-		passLabel := ""
+	for i, pass := range passes {
+		var filled byte
 		switch pass {
-		case 0:
-			passLabel = colorize("Pass 1 (0xFF)", ColorYellow)
-		case 1:
-			passLabel = colorize("Pass 2 (0x00)", ColorYellow)
-		case 2:
-			passLabel = colorize("Pass 3 (random)", ColorYellow)
+		case "0xFF":
+			filled = 0xFF
+			for i := range buf {
+				buf[i] = filled
+			}
+		case "0x00":
+			filled = 0x00
+			for i := range buf {
+				buf[i] = filled
+			}
+		case "random":
+			_ = readUrandom(buf)
 		}
-		prefix := fmt.Sprintf("%s %s", colorize("Shredding", ColorRed), base)
-		fullPrefix := fmt.Sprintf("%s - %s:", prefix, passLabel)
+
+		unix.Seek(fd, 0, 0)
+		remaining := size
+		var written int
+
+		prefix := fmt.Sprintf("%s %s - %s:",
+			colorize("Shredding", ColorRed), base,
+			colorize(fmt.Sprintf("Pass %d (%s)", i+1, pass), ColorYellow))
 
 		for remaining > 0 {
-			toWrite := int(chunkSize)
-			if remaining < int64(toWrite) {
-				toWrite = int(remaining)
+			toWrite := chunkSize
+			if remaining < chunkSize {
+				toWrite = remaining
 			}
-
-			switch pass {
-			case 0:
-				// 0xFF
-				for i := 0; i < toWrite; i++ {
-					buf[i] = 0xFF
-				}
-			case 1:
-				// 0x00
-				for i := 0; i < toWrite; i++ {
-					buf[i] = 0x00
-				}
-			case 2:
-				// random
-				if _, err := rand.Read(buf[:toWrite]); err != nil {
-					return err
-				}
-			}
-
-			n, err := f.Write(buf[:toWrite])
+			n, err := unix.Write(fd, buf[:toWrite])
 			if err != nil {
 				return err
 			}
-			if n != toWrite {
-				return fmt.Errorf("short write while shredding %s", path)
-			}
-
-			remaining -= int64(n)
-			writtenThisPass += int64(n)
-
-			// Show inline progress for this pass
-			printProgress(fullPrefix, uint64(writtenThisPass), uint64(size))
+			remaining -= n
+			written += n
+			printProgress(prefix, uint64(written), uint64(size))
 		}
-
-		// Ensure pass is flushed
-		if err := f.Sync(); err != nil {
-			return err
-		}
+		unix.Fsync(fd)
 	}
 
-	// Close before removal
-	if err := f.Close(); err != nil {
-		return err
-	}
-
-	// Finally remove the file
-	if err := os.Remove(path); err != nil {
-		return err
-	}
-
+	unix.Close(fd)
+	unix.Unlink(path)
 	fmt.Printf("%s %s\n", colorize("Shredded and removed:", ColorGreen), path)
 	return nil
 }
@@ -248,106 +229,139 @@ func shredFiles(files []string) {
 	}
 }
 
+// ================================================================
+// TRIM/Discard Handling
+// ================================================================
+
+func runTrim(path string) error {
+	fmt.Println()
+	switch runtime.GOOS {
+	case "linux":
+		fmt.Println("Detected Linux: attempting direct fstrim syscall...")
+		const FITRIM = 0x00009409
+		type fstrimRange struct {
+			Start  uint64
+			Len    uint64
+			Minlen uint64
+		}
+		fd, err := unix.Open(path, unix.O_RDONLY, 0)
+		if err != nil {
+			return err
+		}
+		defer unix.Close(fd)
+
+		rng := fstrimRange{Start: 0, Len: ^uint64(0), Minlen: 0}
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), FITRIM, uintptr(unsafe.Pointer(&rng)))
+		if errno != 0 {
+			return fmt.Errorf("ioctl FITRIM failed: %v", errno)
+		}
+		fmt.Println("TRIM operation completed successfully.")
+		return nil
+
+	case "darwin":
+		fmt.Println("Detected macOS: TRIM/discard must be performed manually.")
+		fmt.Printf("Suggested: sudo diskutil secureErase freespace 0 %s\n", path)
+		return nil
+
+	default:
+		fmt.Printf("TRIM/discard not supported for OS: %s\n", runtime.GOOS)
+		return nil
+	}
+}
+
+// ================================================================
+// Entry Point
+// ================================================================
+
 func main() {
-	// Configuration
-	outputDir := "./chaff"   // Current directory - change as needed
-	fileSizeMB := int64(100) // Size of each chaff file in MB
+	outputDir := "./chaff"
+	fileSizeMB := int64(100)
 	filePrefix := "chaff_"
 
-	fmt.Println(colorize("=== Chaff Generator ===", ColorCyan))
+	fmt.Println(colorize("=== Low-Level Chaff Generator ===", ColorCyan))
 	fmt.Println(colorize("WARNING: This will fill your disk with random data!", ColorYellow))
-	absPath, _ := filepath.Abs(outputDir)
-	fmt.Printf("%s %s\n", colorize("Target directory:", ColorCyan), absPath)
-	fmt.Printf("%s %d %s\n", colorize("File size:", ColorCyan), fileSizeMB, "MB per file")
+	abs, _ := filepath.Abs(outputDir)
+	fmt.Printf("%s %s\n", colorize("Target directory:", ColorCyan), abs)
+	fmt.Printf("%s %d MB\n", colorize("File size:", ColorCyan), fileSizeMB)
 	fmt.Println()
 
-	// Safety confirmation
 	fmt.Print(colorize("Are you sure you want to continue? (yes/NO): ", ColorRed))
-	var response string
-	fmt.Scanln(&response)
-	if response != "yes" {
+	var resp string
+	fmt.Scanln(&resp)
+	if resp != "yes" {
 		fmt.Println(colorize("Operation cancelled.", ColorGreen))
 		return
 	}
 
-	// Ensure output directory exists
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		fmt.Printf("%s %s: %v\n", colorize("Error creating directory", ColorRed), outputDir, err)
-		return
-	}
+	unix.Mkdir(outputDir, 0755)
 
-	fileCount := 0
-	availableSpace, err := getAvailableSpace(outputDir)
+	available, err := getAvailableSpace(outputDir)
 	if err != nil {
 		fmt.Printf("%s %v\n", colorize("Error getting disk space:", ColorRed), err)
 		return
 	}
 
-	createdFiles := []string{}
-
-	fmt.Printf("\n%s %s\n", colorize("Starting with", ColorCyan), formatBytes(availableSpace))
+	fmt.Printf("\n%s %s\n", colorize("Starting with", ColorCyan), formatBytes(available))
 	fmt.Println(colorize("Generating chaff files...", ColorCyan))
 
-	for availableSpace > 0 {
-		filename := filepath.Join(outputDir, fmt.Sprintf("%s%06d.dat", filePrefix, fileCount))
+	fileCount := 0
+	created := []string{}
 
-		// Check if we're about to run out of space for even a small file
-		if availableSpace < 10*1024*1024 { // Less than 10MB left
-			fmt.Println(colorize("Less than 10MB remaining, creating final small file...", ColorYellow))
-			finalFilename := filepath.Join(outputDir, fmt.Sprintf("%sFINAL.dat", filePrefix))
-			remainingSpace, bytesCreated, err := generateChaffFile(finalFilename, 1, availableSpace)
-			if err != nil {
-				fmt.Printf("%s %v\n", colorize("Error creating final file:", ColorRed), err)
-			} else if bytesCreated > 0 {
-				createdFiles = append(createdFiles, finalFilename)
+	for available > 0 {
+		filename := filepath.Join(outputDir, fmt.Sprintf("%s%06d.dat", filePrefix, fileCount))
+		if available < 10*1024*1024 {
+			fmt.Println(colorize("Less than 10MB remaining, final small file...", ColorYellow))
+			final := filepath.Join(outputDir, fmt.Sprintf("%sFINAL.dat", filePrefix))
+			rem, written, err := generateChaffFile(final, 1, available)
+			if err == nil && written > 0 {
+				created = append(created, final)
 			}
-			availableSpace = remainingSpace
+			available = rem
 			break
 		}
 
-		// Generate regular chaff file
-		remainingSpace, bytesCreated, err := generateChaffFile(filename, fileSizeMB, availableSpace)
+		rem, written, err := generateChaffFile(filename, fileSizeMB, available)
 		if err != nil {
-			fmt.Printf("%s %s: %v\n", colorize("Error creating file", ColorRed), filename, err)
+			fmt.Printf("%s %s: %v\n", colorize("Error creating", ColorRed), filename, err)
 			fileCount++
 			continue
 		}
-
-		if bytesCreated > 0 {
-			createdFiles = append(createdFiles, filename)
+		if written > 0 {
+			created = append(created, filename)
 		}
-
-		availableSpace = remainingSpace
+		available = rem
 		fileCount++
 
-		// Update progress every 10 files
 		if fileCount%10 == 0 {
-			fmt.Printf("%s %d %s\n", colorize("Progress:", ColorCyan), fileCount, formatBytes(availableSpace))
+			fmt.Printf("%s %d %s\n", colorize("Progress:", ColorCyan), fileCount, formatBytes(available))
 		}
 	}
 
 	fmt.Printf("\n%s\n", colorize("=== Generation Complete ===", ColorCyan))
-	fmt.Printf("%s %d\n", colorize("Total files created:", ColorCyan), fileCount)
+	fmt.Printf("%s %d\n", colorize("Files created:", ColorCyan), fileCount)
 
-	// Final space check
-	finalSpace, err := getAvailableSpace(outputDir)
-	if err == nil {
-		fmt.Printf("%s %s\n", colorize("Space remaining before shredding:", ColorCyan), formatBytes(finalSpace))
-	}
+	finalSpace, _ := getAvailableSpace(outputDir)
+	fmt.Printf("%s %s\n", colorize("Space before shredding:", ColorCyan), formatBytes(finalSpace))
 
-	// Shred created files using DoD-like passes
-	if len(createdFiles) > 0 {
+	if len(created) > 0 {
 		fmt.Println()
-		fmt.Println(colorize("Shredding created chaff files...", ColorRed))
-		shredFiles(createdFiles)
+		fmt.Println(colorize("Shredding chaff files...", ColorRed))
+		shredFiles(created)
 	} else {
-		fmt.Println(colorize("No chaff files to shred.", ColorYellow))
+		fmt.Println(colorize("No files to shred.", ColorYellow))
 	}
 
-	// Final space check after shredding
-	finalSpaceAfter, err := getAvailableSpace(outputDir)
-	if err == nil {
-		fmt.Printf("%s %s\n", colorize("Final available space:", ColorCyan), formatBytes(finalSpaceAfter))
+	finalAfter, _ := getAvailableSpace(outputDir)
+	fmt.Printf("%s %s\n", colorize("Final available space:", ColorCyan), formatBytes(finalAfter))
+
+	fmt.Print("\nAttempt TRIM/discard? (yes/NO): ")
+	fmt.Scanln(&resp)
+	if resp == "yes" {
+		if err := runTrim(outputDir); err != nil {
+			fmt.Printf("TRIM failed: %v\n", err)
+		}
+	} else {
+		fmt.Println("Skipping TRIM/discard step.")
 	}
 
 	fmt.Printf("\n%s\n", colorize("=== Operation Complete ===", ColorGreen))
